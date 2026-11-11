@@ -1,0 +1,6 @@
+This product includes software derived from:
+
+- github.com/caddyserver/forwardproxy
+- github.com/klzgrad/forwardproxy (naive branch)
+
+Both are licensed under the Apache License, Version 2.0. See LICENSE.
