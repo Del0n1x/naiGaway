@@ -82,6 +82,18 @@ func (c *Checker) DialContext(ctx context.Context, network, hostPort string) (ne
 		return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("port %s is not allowed", port))
 	}
 
+	// IP targets are common for local services and avoid a resolver round trip.
+	if ip := net.ParseIP(host); ip != nil {
+		if !c.hostAllowed(host, ip) {
+			return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("IP %s is denied", host))
+		}
+		conn, err := c.dial(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err != nil {
+			return nil, caddyhttp.Error(http.StatusBadGateway, err)
+		}
+		return conn, nil
+	}
+
 	domainAllowed := false
 	for _, rule := range c.rules {
 		domainRule, ok := rule.(*domainRule)

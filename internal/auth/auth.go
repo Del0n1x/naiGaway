@@ -2,12 +2,10 @@
 package auth
 
 import (
-	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"net/http"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -20,7 +18,8 @@ type Credential struct {
 
 // Authenticator holds pre-encoded credentials for constant-time comparison.
 type Authenticator struct {
-	credentials [][]byte
+	credentials []string
+	usernames   []string
 }
 
 // New validates and encodes credentials.
@@ -29,7 +28,10 @@ func New(credentials []Credential) (*Authenticator, error) {
 		return nil, errors.New("at least one auth credential is required")
 	}
 
-	authenticator := &Authenticator{credentials: make([][]byte, 0, len(credentials))}
+	authenticator := &Authenticator{
+		credentials: make([]string, 0, len(credentials)),
+		usernames:   make([]string, 0, len(credentials)),
+	}
 	for _, credential := range credentials {
 		if credential.Username == "" {
 			return nil, errors.New("auth username cannot be empty")
@@ -42,32 +44,31 @@ func New(credentials []Credential) (*Authenticator, error) {
 		}
 
 		raw := []byte(credential.Username + ":" + credential.Password)
-		encoded := make([]byte, base64.StdEncoding.EncodedLen(len(raw)))
-		base64.StdEncoding.Encode(encoded, raw)
+		encoded := base64.StdEncoding.EncodeToString(raw)
 		authenticator.credentials = append(authenticator.credentials, encoded)
+		authenticator.usernames = append(authenticator.usernames, credential.Username)
 	}
 	return authenticator, nil
 }
 
 // Check validates the Proxy-Authorization header on req.
 func (a *Authenticator) Check(req *http.Request) error {
-	parts := strings.SplitN(req.Header.Get("Proxy-Authorization"), " ", 2)
-	if len(parts) != 2 {
+	value := req.Header.Get("Proxy-Authorization")
+	space := strings.IndexByte(value, ' ')
+	if space < 0 {
 		return errors.New("Proxy-Authorization is required")
 	}
-	if !strings.EqualFold(parts[0], "Basic") {
+	if !strings.EqualFold(value[:space], "Basic") {
 		return errors.New("unsupported proxy authentication type")
 	}
 
-	provided := []byte(parts[1])
-	for _, expected := range a.credentials {
-		if subtle.ConstantTimeCompare(expected, provided) != 1 {
+	provided := value[space+1:]
+	for i, expected := range a.credentials {
+		if !constantTimeStringEqual(expected, provided) {
 			continue
 		}
 		if repl, ok := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer); ok {
-			if user := decodeUser(expected); user != "" {
-				repl.Set("http.auth.user.id", user)
-			}
+			repl.Set("http.auth.user.id", a.usernames[i])
 		}
 		return nil
 	}
@@ -78,15 +79,15 @@ func (a *Authenticator) Check(req *http.Request) error {
 	return errors.New("invalid credentials")
 }
 
-func decodeUser(encoded []byte) string {
-	decoded := make([]byte, base64.StdEncoding.DecodedLen(len(encoded)))
-	n, err := base64.StdEncoding.Decode(decoded, encoded)
-	if err != nil || !utf8.Valid(decoded[:n]) {
-		return ""
+// constantTimeStringEqual compares equal-length strings without early exit on
+// content. Length is compared first, matching crypto/subtle behavior.
+func constantTimeStringEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	credential := string(decoded[:n])
-	if index := strings.IndexByte(credential, ':'); index >= 0 {
-		return credential[:index]
+	var different byte
+	for i := 0; i < len(a); i++ {
+		different |= a[i] ^ b[i]
 	}
-	return ""
+	return different == 0
 }

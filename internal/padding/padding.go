@@ -43,7 +43,14 @@ func Negotiate(header http.Header, enabled bool) (usePadding bool, reply string)
 
 	requested := header.Get(TypeRequestHeader)
 	if requested != "" {
-		for _, token := range strings.Split(requested, ",") {
+		for len(requested) > 0 {
+			token := requested
+			if index := strings.IndexByte(requested, ','); index >= 0 {
+				token = requested[:index]
+				requested = requested[index+1:]
+			} else {
+				requested = ""
+			}
 			switch strings.TrimSpace(token) {
 			case TypeVariant1:
 				return true, TypeVariant1
@@ -80,16 +87,34 @@ var bufferPool = sync.Pool{
 func NewHeader() string {
 	const symbols = "!#$()+<>?@[]^`{}"
 	length := rand.IntN(32) + 30
-	value := make([]byte, length)
+	var builder strings.Builder
+	builder.Grow(length)
 	bits := rand.Uint64()
 	for i := 0; i < 16; i++ {
-		value[i] = symbols[bits&0x0f]
+		builder.WriteByte(symbols[bits&0x0f])
 		bits >>= 4
 	}
 	for i := 16; i < length; i++ {
-		value[i] = '~'
+		builder.WriteByte('~')
 	}
-	return string(value)
+	return builder.String()
+}
+
+// RawDualStream is the unpadded HTTP/1.1 path. Both endpoints are TCP
+// connections, so io.Copy can use the platform's splice implementation instead
+// of a userspace read/write loop.
+func RawDualStream(target, client net.Conn) error {
+	go func() {
+		_, _ = io.Copy(target, client)
+		if closer, ok := target.(closeWriter); ok {
+			_ = closer.CloseWrite()
+		}
+	}()
+	_, err := io.Copy(client, target)
+	if closer, ok := client.(closeWriter); ok {
+		_ = closer.CloseWrite()
+	}
+	return err
 }
 
 // DualStream copies bytes in both directions until the client-to-target side

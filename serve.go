@@ -143,7 +143,7 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn, alreadyResponded bo
 		return fmt.Errorf("flush hijacked connection: %w", err)
 	}
 
-	return padding.DualStream(targetConn, clientConn, clientConn, false)
+	return padding.RawDualStream(targetConn, clientConn)
 }
 
 func (h *Handler) serveHTTPProxy(w http.ResponseWriter, r *http.Request) error {
@@ -158,14 +158,7 @@ func (h *Handler) serveHTTPProxy(w http.ResponseWriter, r *http.Request) error {
 	r.ProtoMinor = 1
 	r.RequestURI = ""
 
-	removeHopByHop(r.Header)
-
-	if !h.HideIP {
-		r.Header.Add("Forwarded", fmt.Sprintf("for=%q", r.RemoteAddr))
-	}
-	if !h.HideVia {
-		r.Header.Add("Via", "1.1 caddy")
-	}
+	h.sanitizeProxyHeaders(r.Header, r.RemoteAddr)
 
 	response, err := h.httpTransport.RoundTrip(r)
 	if err != nil {
@@ -177,6 +170,32 @@ func (h *Handler) serveHTTPProxy(w http.ResponseWriter, r *http.Request) error {
 		_ = r.Body.Close()
 	}
 	return forwardResponse(w, response, h.HideVia)
+}
+
+// sanitizeProxyHeaders removes client-controlled forwarding metadata before
+// the request is sent to the target. This prevents clients from smuggling
+// their real IP or spoofing a Via chain when hide_ip/hide_via are enabled.
+func (h *Handler) sanitizeProxyHeaders(header http.Header, remoteAddr string) {
+	removeHopByHop(header)
+	for _, name := range forwardingHeaders {
+		header.Del(name)
+	}
+	if !h.HideIP {
+		header.Set("Forwarded", fmt.Sprintf("for=%q", remoteAddr))
+	}
+	if !h.HideVia {
+		header.Set("Via", "1.1 caddy")
+	}
+}
+
+var forwardingHeaders = []string{
+	"Forwarded",
+	"X-Forwarded-For",
+	"X-Forwarded-Host",
+	"X-Forwarded-Proto",
+	"X-Real-Ip",
+	"Client-Ip",
+	"Via",
 }
 
 func forwardResponse(w http.ResponseWriter, response *http.Response, hideVia bool) error {
