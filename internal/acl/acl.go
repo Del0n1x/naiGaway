@@ -1,4 +1,16 @@
 // Package acl provides destination access-control checks for the proxy.
+//
+// Matching order is:
+//
+//  1. The target port is checked against the configured allow-list.
+//  2. User domain rules are evaluated in declaration order. The first matching
+//     rule decides; a domain allow bypasses per-IP checks.
+//  3. User IP and "all" rules are evaluated in declaration order, followed by
+//     the built-in private-range denials and a final allow-all.
+//
+// Within each phase the first matching rule wins. Because domain rules are a
+// separate phase, an earlier "all" rule does not override a later domain deny
+// for a domain target.
 package acl
 
 import (
@@ -13,8 +25,8 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
-// Rule is a user-defined access control rule. Rules are evaluated in order,
-// before the built-in private-range denials.
+// Rule is a user-defined access control rule. Domain rules run before IP rules
+// for domain targets; within each phase, rules run in declaration order.
 type Rule struct {
 	Subjects []string `json:"subjects,omitempty"`
 	Allow    bool     `json:"allow,omitempty"`
@@ -22,7 +34,8 @@ type Rule struct {
 
 // Checker resolves and dials targets after applying ACL and port rules.
 type Checker struct {
-	rules        []rule
+	domainRules  []*domainRule
+	ipRules      []rule
 	allowedPorts map[int]struct{}
 	dial         func(context.Context, string, string) (net.Conn, error)
 }
@@ -54,7 +67,11 @@ func New(rules []Rule, allowedPorts []int, dial func(context.Context, string, st
 			if err != nil {
 				return nil, fmt.Errorf("invalid ACL subject %q: %w", subject, err)
 			}
-			checker.rules = append(checker.rules, compiled)
+			if domainRule, ok := compiled.(*domainRule); ok {
+				checker.domainRules = append(checker.domainRules, domainRule)
+				continue
+			}
+			checker.ipRules = append(checker.ipRules, compiled)
 		}
 	}
 	for _, cidr := range defaultDeniedCIDRs {
@@ -62,13 +79,15 @@ func New(rules []Rule, allowedPorts []int, dial func(context.Context, string, st
 		if err != nil {
 			return nil, fmt.Errorf("invalid built-in ACL subject %q: %w", cidr, err)
 		}
-		checker.rules = append(checker.rules, compiled)
+		checker.ipRules = append(checker.ipRules, compiled)
 	}
-	checker.rules = append(checker.rules, &allRule{allow: true})
+	checker.ipRules = append(checker.ipRules, &allRule{allow: true})
 	return checker, nil
 }
 
 // DialContext resolves the target and dials only addresses permitted by ACL.
+// For domain targets, a matching domain allow bypasses per-IP checks; otherwise
+// every resolved address must pass ipAllowed.
 func (c *Checker) DialContext(ctx context.Context, network, hostPort string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
 		return nil, caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("network %q is not supported", network))
@@ -84,7 +103,7 @@ func (c *Checker) DialContext(ctx context.Context, network, hostPort string) (ne
 
 	// IP targets are common for local services and avoid a resolver round trip.
 	if ip := net.ParseIP(host); ip != nil {
-		if !c.hostAllowed(host, ip) {
+		if !c.ipAllowed(ip) {
 			return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("IP %s is denied", host))
 		}
 		conn, err := c.dial(ctx, network, net.JoinHostPort(ip.String(), port))
@@ -94,21 +113,14 @@ func (c *Checker) DialContext(ctx context.Context, network, hostPort string) (ne
 		return conn, nil
 	}
 
+	// Domain rules run before DNS resolution, so an explicit deny can reject a
+	// hostname without touching the network.
 	domainAllowed := false
-	for _, rule := range c.rules {
-		domainRule, ok := rule.(*domainRule)
-		if !ok {
-			continue
-		}
-		switch domainRule.tryMatch(nil, host) {
-		case decisionDeny:
-			return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("domain %s is denied", host))
-		case decisionAllow:
-			domainAllowed = true
-		}
-		if domainAllowed {
-			break
-		}
+	switch c.domainDecision(host) {
+	case decisionDeny:
+		return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("domain %s is denied", host))
+	case decisionAllow:
+		domainAllowed = true
 	}
 
 	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
@@ -118,7 +130,7 @@ func (c *Checker) DialContext(ctx context.Context, network, hostPort string) (ne
 
 	var lastErr error
 	for _, address := range addresses {
-		if !domainAllowed && !c.hostAllowed(host, address.IP) {
+		if !domainAllowed && !c.ipAllowed(address.IP) {
 			continue
 		}
 		conn, err := c.dial(ctx, network, net.JoinHostPort(address.IP.String(), port))
@@ -133,9 +145,22 @@ func (c *Checker) DialContext(ctx context.Context, network, hostPort string) (ne
 	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
 }
 
-func (c *Checker) hostAllowed(hostname string, ip net.IP) bool {
-	for _, rule := range c.rules {
-		switch rule.tryMatch(ip, hostname) {
+// domainDecision evaluates only user domain rules. Domain rules run before IP
+// rules, so a domain allow may bypass the built-in private-range denials.
+func (c *Checker) domainDecision(host string) decision {
+	for _, rule := range c.domainRules {
+		if decision := rule.tryMatch(nil, host); decision != decisionNoMatch {
+			return decision
+		}
+	}
+	return decisionNoMatch
+}
+
+// ipAllowed evaluates user IP/all rules, then the built-in denials, then the
+// final allow-all. Domain rules are not part of this phase.
+func (c *Checker) ipAllowed(ip net.IP) bool {
+	for _, rule := range c.ipRules {
+		switch rule.tryMatch(ip, "") {
 		case decisionDeny:
 			return false
 		case decisionAllow:
@@ -191,7 +216,7 @@ type domainRule struct {
 }
 
 func (r *domainRule) tryMatch(_ net.IP, domain string) decision {
-	domain = strings.TrimPrefix(domain, ".")
+	domain = strings.TrimPrefix(normalizeDomain(domain), ".")
 	if domain != r.domain && !(r.subdomainsAllowed && strings.HasSuffix(domain, "."+r.domain)) {
 		return decisionNoMatch
 	}
@@ -229,7 +254,8 @@ var defaultDeniedCIDRs = []string{
 }
 
 func newRule(subject string, allow bool) (rule, error) {
-	if subject == "all" {
+	normalized := normalizeDomain(subject)
+	if normalized == "all" {
 		return &allRule{allow: allow}, nil
 	}
 
@@ -248,23 +274,22 @@ func newRule(subject string, allow bool) (rule, error) {
 	}
 
 	subdomainsAllowed := false
-	if strings.HasPrefix(subject, "*.") {
+	if strings.HasPrefix(normalized, "*.") {
 		subdomainsAllowed = true
-		subject = subject[2:]
+		normalized = normalized[2:]
 	}
-	if err := validDomain(subject); err != nil {
+	if err := validDomain(normalized); err != nil {
 		return nil, fmt.Errorf("%q is not an IP, CIDR, or domain: %w", subject, err)
 	}
 	return &domainRule{
-		domain:            subject,
+		domain:            normalized,
 		subdomainsAllowed: subdomainsAllowed,
 		allow:             allow,
 	}, nil
 }
 
-// ValidDomain validates a hostname used in configuration.
-func ValidDomain(domain string) error {
-	return validDomain(domain)
+func normalizeDomain(domain string) string {
+	return strings.TrimSuffix(strings.ToLower(domain), ".")
 }
 
 func validDomain(domain string) error {

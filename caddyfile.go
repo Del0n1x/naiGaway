@@ -1,9 +1,6 @@
 package naiveproxy
 
 import (
-	"bufio"
-	"fmt"
-	"os"
 	"strconv"
 	"strings"
 
@@ -37,13 +34,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 	for d.NextBlock(0) {
 		switch d.Val() {
-		case "hosts":
-			args := d.RemainingArgs()
-			if len(args) == 0 {
-				return d.ArgErr()
-			}
-			h.Hosts = caddyhttp.MatchHost(args)
-
 		case "auth":
 			args := d.RemainingArgs()
 			if len(args) != 2 {
@@ -59,27 +49,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Err("auth password cannot be empty")
 			}
 			h.Auth = append(h.Auth, auth.Credential{Username: args[0], Password: args[1]})
-
-		case "probe_resistance":
-			args := d.RemainingArgs()
-			if len(args) > 1 {
-				return d.ArgErr()
-			}
-			if len(args) == 1 {
-				h.ProbeResistanceDomain = args[0]
-			}
-
-		case "hide_ip":
-			if len(d.RemainingArgs()) != 0 {
-				return d.ArgErr()
-			}
-			h.HideIP = true
-
-		case "hide_via":
-			if len(d.RemainingArgs()) != 0 {
-				return d.ArgErr()
-			}
-			h.HideVia = true
 
 		case "padding":
 			value, err := parseOptionalBool(d, true)
@@ -117,20 +86,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.DialTimeout = caddy.Duration(value)
 
-		case "max_idle_conns":
-			value, err := parseIntArg(d)
-			if err != nil {
-				return err
-			}
-			h.MaxIdleConns = value
-
-		case "max_idle_conns_per_host":
-			value, err := parseIntArg(d)
-			if err != nil {
-				return err
-			}
-			h.MaxIdleConnsPerHost = value
-
 		case "allow_ports":
 			args := d.RemainingArgs()
 			if len(args) == 0 {
@@ -160,26 +115,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					allow = true
 				case "deny":
 					allow = false
-				case "allow_file":
-					if len(args) != 1 {
-						return d.ArgErr()
-					}
-					subjects, err := readACLFile(args[0])
-					if err != nil {
-						return err
-					}
-					h.ACL = append(h.ACL, acl.Rule{Subjects: subjects, Allow: true})
-					continue
-				case "deny_file":
-					if len(args) != 1 {
-						return d.ArgErr()
-					}
-					subjects, err := readACLFile(args[0])
-					if err != nil {
-						return err
-					}
-					h.ACL = append(h.ACL, acl.Rule{Subjects: subjects, Allow: false})
-					continue
 				default:
 					return d.Errf("unknown acl directive %q", directive)
 				}
@@ -211,41 +146,4 @@ func parseOptionalBool(d *caddyfile.Dispenser, defaultValue bool) (bool, error) 
 	default:
 		return false, d.ArgErr()
 	}
-}
-
-func parseIntArg(d *caddyfile.Dispenser) (int, error) {
-	args := d.RemainingArgs()
-	if len(args) != 1 {
-		return 0, d.ArgErr()
-	}
-	value, err := strconv.Atoi(args[0])
-	if err != nil {
-		return 0, d.Errf("expected an integer, got %q", args[0])
-	}
-	return value, nil
-}
-
-func readACLFile(path string) ([]string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var subjects []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		subjects = append(subjects, line)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	if len(subjects) == 0 {
-		return nil, fmt.Errorf("ACL file %s contains no subjects", path)
-	}
-	return subjects, nil
 }

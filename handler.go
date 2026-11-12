@@ -2,11 +2,8 @@
 package naiveproxy
 
 import (
-	"context"
 	"fmt"
 	"net"
-	"net/http"
-	"strings"
 	"time"
 
 	"github.com/Del0n1x/naiGaway/internal/acl"
@@ -14,7 +11,6 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"go.uber.org/zap"
 )
 
 func init() {
@@ -28,27 +24,8 @@ func init() {
 // behavior (padding, fast open and long-lived authenticated tunnels) is layered
 // on top of that tunnel.
 type Handler struct {
-	// Hosts are the public hostnames of this NaiveProxy endpoint. They are used
-	// only to route ordinary website requests to the next handler; CONNECT
-	// requests are routed by their target host and are unaffected.
-	Hosts caddyhttp.MatchHost `json:"hosts,omitempty"`
-
 	// Auth is the list of accepted proxy credentials.
 	Auth []auth.Credential `json:"auth,omitempty"`
-
-	// ProbeResistanceDomain is an optional secret hostname. Requests for this
-	// host receive an authentication page instead of falling through to the
-	// website. Naive clients do not need it because they send credentials
-	// preemptively.
-	ProbeResistanceDomain string `json:"probe_resistance_domain,omitempty"`
-
-	// HideIP prevents the client IP from being added to Forwarded headers on
-	// plain HTTP proxy requests.
-	HideIP bool `json:"hide_ip,omitempty"`
-
-	// HideVia prevents the Via header from being added on plain HTTP proxy
-	// requests.
-	HideVia bool `json:"hide_via,omitempty"`
 
 	// Padding enables the NaiveProxy padding protocol. Default: true.
 	Padding *bool `json:"padding,omitempty"`
@@ -63,25 +40,15 @@ type Handler struct {
 	// DialTimeout limits the initial TCP connection to the target. Default: 30s.
 	DialTimeout caddy.Duration `json:"dial_timeout,omitempty"`
 
-	// MaxIdleConns is the maximum number of idle connections kept by the plain
-	// HTTP proxy transport. Default: 50.
-	MaxIdleConns int `json:"max_idle_conns,omitempty"`
-
-	// MaxIdleConnsPerHost is the maximum number of idle connections per target.
-	MaxIdleConnsPerHost int `json:"max_idle_conns_per_host,omitempty"`
-
-	// AllowedPorts restricts CONNECT and HTTP proxy targets to these ports.
+	// AllowedPorts restricts CONNECT targets to these ports.
 	// Empty means all ports.
 	AllowedPorts []int `json:"allowed_ports,omitempty"`
 
 	// ACL is evaluated before the built-in private-range denials.
 	ACL []acl.Rule `json:"acl,omitempty"`
 
-	logger        *zap.Logger
 	authenticator *auth.Authenticator
 	aclChecker    *acl.Checker
-	httpTransport *http.Transport
-	dialContext   func(context.Context, string, string) (net.Conn, error)
 }
 
 // CaddyModule returns the Caddy module information.
@@ -93,49 +60,23 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 }
 
 // Provision prepares the handler.
-func (h *Handler) Provision(ctx caddy.Context) error {
-	h.logger = ctx.Logger(h)
-
+func (h *Handler) Provision(_ caddy.Context) error {
 	authenticator, err := auth.New(h.Auth)
 	if err != nil {
 		return err
 	}
 	h.authenticator = authenticator
 
-	if h.DialTimeout <= 0 {
-		h.DialTimeout = caddy.Duration(30 * time.Second)
-	}
-	if h.IdleTimeout <= 0 {
-		h.IdleTimeout = caddy.Duration(24 * time.Hour)
-	}
-
-	maxIdleConns := h.MaxIdleConns
-	if maxIdleConns == 0 {
-		maxIdleConns = 50
-	}
-	if maxIdleConns < 0 {
-		maxIdleConns = 0
-	}
-
-	h.httpTransport = &http.Transport{
-		MaxIdleConns:        maxIdleConns,
-		MaxIdleConnsPerHost: h.MaxIdleConnsPerHost,
-		IdleConnTimeout:     60 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-	}
-
 	dialer := &net.Dialer{
-		Timeout:   time.Duration(h.DialTimeout),
+		Timeout:   h.dialTimeout(),
 		KeepAlive: 30 * time.Second,
 	}
-	h.dialContext = dialer.DialContext
 
-	checker, err := acl.New(h.ACL, h.AllowedPorts, h.dialContext)
+	checker, err := acl.New(h.ACL, h.AllowedPorts, dialer.DialContext)
 	if err != nil {
 		return err
 	}
 	h.aclChecker = checker
-	h.httpTransport.DialContext = checker.DialContext
 
 	return nil
 }
@@ -151,24 +92,10 @@ func (h *Handler) Validate() error {
 	if h.IdleTimeout < 0 {
 		return fmt.Errorf("idle_timeout cannot be negative")
 	}
-	if h.ProbeResistanceDomain != "" {
-		domain := strings.TrimSuffix(strings.ToLower(h.ProbeResistanceDomain), ".")
-		if err := acl.ValidDomain(domain); err != nil {
-			return fmt.Errorf("invalid probe_resistance_domain: %w", err)
-		}
-	}
 	for _, port := range h.AllowedPorts {
 		if port <= 0 || port > 65535 {
 			return fmt.Errorf("allowed port %d is outside 1-65535", port)
 		}
-	}
-	return nil
-}
-
-// Cleanup releases idle connections.
-func (h *Handler) Cleanup() error {
-	if h.httpTransport != nil {
-		h.httpTransport.CloseIdleConnections()
 	}
 	return nil
 }
@@ -181,8 +108,15 @@ func (h *Handler) fastOpenEnabled() bool {
 	return boolDefault(h.FastOpen, true)
 }
 
+func (h *Handler) dialTimeout() time.Duration {
+	if h.DialTimeout == 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(h.DialTimeout)
+}
+
 func (h *Handler) idleTimeout() time.Duration {
-	if h.IdleTimeout <= 0 {
+	if h.IdleTimeout == 0 {
 		return 24 * time.Hour
 	}
 	return time.Duration(h.IdleTimeout)
@@ -200,7 +134,6 @@ var (
 	_ caddy.Module                = (*Handler)(nil)
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddy.Validator             = (*Handler)(nil)
-	_ caddy.CleanerUpper          = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 	_ caddyfile.Unmarshaler       = (*Handler)(nil)
 )

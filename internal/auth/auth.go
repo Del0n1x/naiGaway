@@ -16,10 +16,14 @@ type Credential struct {
 	Password string `json:"password"`
 }
 
+type entry struct {
+	encoded  string
+	username string
+}
+
 // Authenticator holds pre-encoded credentials for constant-time comparison.
 type Authenticator struct {
-	credentials []string
-	usernames   []string
+	entries []entry
 }
 
 // New validates and encodes credentials.
@@ -29,8 +33,7 @@ func New(credentials []Credential) (*Authenticator, error) {
 	}
 
 	authenticator := &Authenticator{
-		credentials: make([]string, 0, len(credentials)),
-		usernames:   make([]string, 0, len(credentials)),
+		entries: make([]entry, 0, len(credentials)),
 	}
 	for _, credential := range credentials {
 		if credential.Username == "" {
@@ -44,9 +47,10 @@ func New(credentials []Credential) (*Authenticator, error) {
 		}
 
 		raw := []byte(credential.Username + ":" + credential.Password)
-		encoded := base64.StdEncoding.EncodeToString(raw)
-		authenticator.credentials = append(authenticator.credentials, encoded)
-		authenticator.usernames = append(authenticator.usernames, credential.Username)
+		authenticator.entries = append(authenticator.entries, entry{
+			encoded:  base64.StdEncoding.EncodeToString(raw),
+			username: credential.Username,
+		})
 	}
 	return authenticator, nil
 }
@@ -63,12 +67,12 @@ func (a *Authenticator) Check(req *http.Request) error {
 	}
 
 	provided := value[space+1:]
-	for i, expected := range a.credentials {
-		if !constantTimeStringEqual(expected, provided) {
+	for _, credential := range a.entries {
+		if !constantTimeStringEqual(credential.encoded, provided) {
 			continue
 		}
 		if repl, ok := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer); ok {
-			repl.Set("http.auth.user.id", a.usernames[i])
+			repl.Set("http.auth.user.id", credential.username)
 		}
 		return nil
 	}

@@ -2,11 +2,8 @@ package naiveproxy
 
 import (
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"strings"
-	"sync"
 
 	"github.com/Del0n1x/naiGaway/internal/padding"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -14,36 +11,15 @@ import (
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	authErr := h.authenticator.Check(r)
-
-	if h.ProbeResistanceDomain != "" && strings.EqualFold(hostOnly(r.Host), h.ProbeResistanceDomain) {
-		return serveProbePage(w, authErr)
-	}
-
-	// Non-CONNECT requests to the public hostname are ordinary website
-	// requests. CONNECT requests always retain their target Host, so they are
-	// never swallowed by this branch.
-	if h.Hosts.Match(r) && r.Method != http.MethodConnect {
+	// This handler only proxies CONNECT. Ordinary HTTP requests always fall
+	// through to the website/reverse-proxy routes, whether authenticated or not.
+	if r.Method != http.MethodConnect {
 		return next.ServeHTTP(w, r)
 	}
-
-	// Probe resistance: never reveal the proxy with a 407. Unauthenticated
-	// requests fall through to the normal website/reverse-proxy routes.
-	if authErr != nil {
+	if h.authenticator.Check(r) != nil {
 		return next.ServeHTTP(w, r)
 	}
-
-	if r.Method == http.MethodConnect {
-		return h.serveConnect(w, r)
-	}
-	return h.serveHTTPProxy(w, r)
-}
-
-func hostOnly(host string) string {
-	if hostname, _, err := net.SplitHostPort(host); err == nil {
-		host = hostname
-	}
-	return strings.ToLower(strings.TrimSuffix(host, "."))
+	return h.serveConnect(w, r)
 }
 
 func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request) error {
@@ -144,108 +120,4 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn, alreadyResponded bo
 	}
 
 	return padding.RawDualStream(targetConn, clientConn)
-}
-
-func (h *Handler) serveHTTPProxy(w http.ResponseWriter, r *http.Request) error {
-	if r.URL.Scheme == "" {
-		r.URL.Scheme = "http"
-	}
-	if r.URL.Host == "" {
-		r.URL.Host = r.Host
-	}
-	r.Proto = "HTTP/1.1"
-	r.ProtoMajor = 1
-	r.ProtoMinor = 1
-	r.RequestURI = ""
-
-	h.sanitizeProxyHeaders(r.Header, r.RemoteAddr)
-
-	response, err := h.httpTransport.RoundTrip(r)
-	if err != nil {
-		return caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("upstream request: %w", err))
-	}
-	defer response.Body.Close()
-
-	if r.Body != nil {
-		_ = r.Body.Close()
-	}
-	return forwardResponse(w, response, h.HideVia)
-}
-
-// sanitizeProxyHeaders removes client-controlled forwarding metadata before
-// the request is sent to the target. This prevents clients from smuggling
-// their real IP or spoofing a Via chain when hide_ip/hide_via are enabled.
-func (h *Handler) sanitizeProxyHeaders(header http.Header, remoteAddr string) {
-	removeHopByHop(header)
-	for _, name := range forwardingHeaders {
-		header.Del(name)
-	}
-	if !h.HideIP {
-		header.Set("Forwarded", fmt.Sprintf("for=%q", remoteAddr))
-	}
-	if !h.HideVia {
-		header.Set("Via", "1.1 caddy")
-	}
-}
-
-var forwardingHeaders = []string{
-	"Forwarded",
-	"X-Forwarded-For",
-	"X-Forwarded-Host",
-	"X-Forwarded-Proto",
-	"X-Real-Ip",
-	"Client-Ip",
-	"Via",
-}
-
-func forwardResponse(w http.ResponseWriter, response *http.Response, hideVia bool) error {
-	w.Header().Del("Server")
-	if !hideVia {
-		w.Header().Add("Via", fmt.Sprintf("%d.%d caddy", response.ProtoMajor, response.ProtoMinor))
-	}
-	for name, values := range response.Header {
-		for _, value := range values {
-			w.Header().Add(name, value)
-		}
-	}
-	removeHopByHop(w.Header())
-
-	w.WriteHeader(response.StatusCode)
-
-	buffer := responseBufferPool.Get().(*[]byte)
-	defer responseBufferPool.Put(buffer)
-	if _, err := io.CopyBuffer(w, response.Body, *buffer); err != nil {
-		return fmt.Errorf("copy response body: %w", err)
-	}
-	return nil
-}
-
-var responseBufferPool = sync.Pool{
-	New: func() any {
-		buffer := make([]byte, 64*1024)
-		return &buffer
-	},
-}
-
-func removeHopByHop(header http.Header) {
-	for _, name := range strings.Split(header.Get("Connection"), ",") {
-		if name = strings.TrimSpace(name); name != "" {
-			header.Del(name)
-		}
-	}
-	for _, name := range hopByHopHeaders {
-		header.Del(name)
-	}
-}
-
-var hopByHopHeaders = []string{
-	"Connection",
-	"Proxy-Connection",
-	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"Te",
-	"Trailer",
-	"Transfer-Encoding",
-	"Upgrade",
 }
