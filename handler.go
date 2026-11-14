@@ -40,12 +40,8 @@ type Handler struct {
 	// DialTimeout limits the initial TCP connection to the target. Default: 30s.
 	DialTimeout caddy.Duration `json:"dial_timeout,omitempty"`
 
-	// AllowedPorts restricts CONNECT targets to these ports.
-	// Empty means all ports.
-	AllowedPorts []int `json:"allowed_ports,omitempty"`
-
-	// ACL is evaluated before the built-in private-range denials.
-	ACL []acl.Rule `json:"acl,omitempty"`
+	// ACL controls destination ports, domains, and IP addresses.
+	ACL acl.Config `json:"acl,omitempty"`
 
 	authenticator *auth.Authenticator
 	aclChecker    *acl.Checker
@@ -72,7 +68,7 @@ func (h *Handler) Provision(_ caddy.Context) error {
 		KeepAlive: 30 * time.Second,
 	}
 
-	checker, err := acl.New(h.ACL, h.AllowedPorts, dialer.DialContext)
+	checker, err := acl.New(h.ACL, dialer.DialContext)
 	if err != nil {
 		return err
 	}
@@ -91,11 +87,6 @@ func (h *Handler) Validate() error {
 	}
 	if h.IdleTimeout < 0 {
 		return fmt.Errorf("idle_timeout cannot be negative")
-	}
-	for _, port := range h.AllowedPorts {
-		if port <= 0 || port > 65535 {
-			return fmt.Errorf("allowed port %d is outside 1-65535", port)
-		}
 	}
 	return nil
 }

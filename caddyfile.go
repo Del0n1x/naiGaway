@@ -1,7 +1,6 @@
 package naiveproxy
 
 import (
-	"strconv"
 	"strings"
 
 	"github.com/Del0n1x/naiGaway/internal/acl"
@@ -14,7 +13,7 @@ import (
 
 func init() {
 	httpcaddyfile.RegisterHandlerDirective("naive_proxy", parseCaddyfile)
-	httpcaddyfile.RegisterDirectiveOrder("naive_proxy", httpcaddyfile.Before, "reverse_proxy")
+	httpcaddyfile.RegisterDirectiveOrder("naive_proxy", httpcaddyfile.Before, "respond")
 }
 
 func parseCaddyfile(helper httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
@@ -86,39 +85,9 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.DialTimeout = caddy.Duration(value)
 
-		case "allow_ports":
-			args := d.RemainingArgs()
-			if len(args) == 0 {
-				return d.ArgErr()
-			}
-			ports := make([]int, 0, len(args))
-			for _, arg := range args {
-				port, err := strconv.Atoi(arg)
-				if err != nil || port <= 0 || port > 65535 {
-					return d.Errf("invalid port %q", arg)
-				}
-				ports = append(ports, port)
-			}
-			h.AllowedPorts = ports
-
 		case "acl":
-			for nested := d.Nesting(); d.NextBlock(nested); {
-				directive := d.Val()
-				args := d.RemainingArgs()
-				if len(args) == 0 {
-					return d.ArgErr()
-				}
-
-				var allow bool
-				switch directive {
-				case "allow":
-					allow = true
-				case "deny":
-					allow = false
-				default:
-					return d.Errf("unknown acl directive %q", directive)
-				}
-				h.ACL = append(h.ACL, acl.Rule{Subjects: args, Allow: allow})
+			if err := parseACL(d, &h.ACL); err != nil {
+				return err
 			}
 
 		default:
@@ -126,6 +95,41 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		}
 	}
 
+	return nil
+}
+
+func parseACL(d *caddyfile.Dispenser, config *acl.Config) error {
+	for sectionNesting := d.Nesting(); d.NextBlock(sectionNesting); {
+		var rules *[]acl.Rule
+		switch d.Val() {
+		case "port":
+			rules = &config.Port
+		case "domain":
+			rules = &config.Domain
+		case "ip":
+			rules = &config.IP
+		default:
+			return d.Errf("unknown acl section %q", d.Val())
+		}
+
+		for ruleNesting := d.Nesting(); d.NextBlock(ruleNesting); {
+			var allow bool
+			switch d.Val() {
+			case "allow":
+				allow = true
+			case "deny":
+				allow = false
+			default:
+				return d.Errf("unknown acl rule %q", d.Val())
+			}
+
+			subjects := d.RemainingArgs()
+			if len(subjects) == 0 {
+				return d.ArgErr()
+			}
+			*rules = append(*rules, acl.Rule{Subjects: subjects, Allow: allow})
+		}
+	}
 	return nil
 }
 
