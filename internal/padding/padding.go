@@ -100,23 +100,6 @@ func NewHeader() string {
 	return builder.String()
 }
 
-// RawDualStream is the unpadded HTTP/1.1 path. Both endpoints are TCP
-// connections, so io.Copy can use the platform's splice implementation instead
-// of a userspace read/write loop.
-func RawDualStream(target, client net.Conn) error {
-	go func() {
-		_, _ = io.Copy(target, client)
-		if closer, ok := target.(closeWriter); ok {
-			_ = closer.CloseWrite()
-		}
-	}()
-	_, err := io.Copy(client, target)
-	if closer, ok := client.(closeWriter); ok {
-		_ = closer.CloseWrite()
-	}
-	return err
-}
-
 // DualStream copies bytes in both directions until the client-to-target side
 // ends. Padding is applied only when both peers opted in.
 func DualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, enabled bool) error {

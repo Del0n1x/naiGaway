@@ -9,7 +9,6 @@ import (
 	"github.com/Del0n1x/naiGaway/internal/acl"
 	"github.com/Del0n1x/naiGaway/internal/auth"
 	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -126,5 +125,4 @@ var (
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddy.Validator             = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
-	_ caddyfile.Unmarshaler       = (*Handler)(nil)
 )
