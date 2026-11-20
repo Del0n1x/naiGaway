@@ -1,4 +1,4 @@
-module github.com/Del0n1x/naiGaway
+module github.com/Del0n1x/caddyNaive
 
 go 1.26.0
 

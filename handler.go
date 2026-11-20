@@ -6,8 +6,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/Del0n1x/naiGaway/internal/acl"
-	"github.com/Del0n1x/naiGaway/internal/auth"
+	"github.com/Del0n1x/caddyNaive/internal/acl"
+	"github.com/Del0n1x/caddyNaive/internal/auth"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )

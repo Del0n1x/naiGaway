@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/Del0n1x/naiGaway/internal/padding"
+	"github.com/Del0n1x/caddyNaive/internal/padding"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
