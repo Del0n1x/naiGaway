@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Del0n1x/caddyNaive/internal/dialer/acl"
+	"github.com/Del0n1x/caddyNaive/internal/dialer/uot"
 )
 
 // Config controls target resolution and TCP dialing.
@@ -53,72 +54,100 @@ func New(config Config) (*Dialer, error) {
 	}, nil
 }
 
-// DialTCP resolves and authorizes hostPort, then dials the first reachable
-// allowed TCP address.
-func (d *Dialer) DialTCP(ctx context.Context, hostPort string) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(ctx, d.timeout)
-	defer cancel()
-
-	endpoint, err := d.resolve(ctx, hostPort)
+// Dial resolves and authorizes hostPort, then opens the corresponding
+// connection. The UoT v2 magic address creates a UDP-backed stream; all other
+// targets are dialed as TCP.
+func (d *Dialer) Dial(ctx context.Context, hostPort string) (net.Conn, error) {
+	host, portText, err := net.SplitHostPort(hostPort)
 	if err != nil {
 		return nil, err
 	}
-	return d.dialAny(ctx, "tcp", endpoint)
-}
-
-type endpoint struct {
-	host string
-	port int
-	ips  []netip.Addr
-}
-
-// resolve parses hostPort, applies the ACL, resolves the target, and filters
-// the result to the addresses allowed by the IP gate.
-func (d *Dialer) resolve(ctx context.Context, hostPort string) (endpoint, error) {
-	host, portText, err := net.SplitHostPort(hostPort)
-	if err != nil {
-		return endpoint{}, err
+	if uot.IsMagic(host) {
+		return d.dialUoT()
 	}
-	if host == "" {
-		return endpoint{}, fmt.Errorf("target host is empty")
-	}
+
 	port, err := strconv.Atoi(portText)
-	if err != nil || port < 1 || port > 65535 {
-		return endpoint{}, fmt.Errorf("invalid target port %q", portText)
+	if err != nil {
+		return nil, fmt.Errorf("invalid target port %q", portText)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, d.timeout)
+	defer cancel()
+
+	ips, err := d.resolve(ctx, host, port)
+	if err != nil {
+		return nil, err
+	}
+
+	var lastErr error
+	for _, ip := range ips {
+		address := net.JoinHostPort(ip.String(), strconv.Itoa(port))
+		conn, err := d.netDialer.DialContext(ctx, "tcp", address)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = fmt.Errorf("dial %s: %w", address, err)
+	}
+	if lastErr == nil {
+		return nil, fmt.Errorf("no allowed IP addresses for %s", host)
+	}
+	return nil, lastErr
+}
+
+func (d *Dialer) dialUoT() (net.Conn, error) {
+	packetConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := uot.NewServerConn(packetConn, d.resolve)
+	if err != nil {
+		packetConn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// resolve applies port, domain, and IP policy and resolves the destination to
+// the addresses that may be used. It is transport-independent and is the only
+// place where ACL and DNS are consulted; both TCP and UoT call it.
+func (d *Dialer) resolve(ctx context.Context, host string, port int) ([]netip.Addr, error) {
+	if host == "" {
+		return nil, fmt.Errorf("target host is empty")
+	}
+	if port < 1 || port > 65535 {
+		return nil, fmt.Errorf("invalid target port %d", port)
 	}
 	if !d.acl.AllowPort(port) {
-		return endpoint{}, fmt.Errorf("port %d is not allowed", port)
+		return nil, fmt.Errorf("port %d is not allowed", port)
 	}
-
-	resolved := endpoint{host: host, port: port}
 
 	// IP literals skip DNS and the domain gate.
 	if ip, err := netip.ParseAddr(host); err == nil {
 		if ip.Zone() != "" {
-			return endpoint{}, fmt.Errorf("IP zones are not supported")
+			return nil, fmt.Errorf("IP zones are not supported")
 		}
 		ip = ip.Unmap()
 		if !d.acl.AllowIP(ip) {
-			return endpoint{}, fmt.Errorf("IP %s is denied", host)
+			return nil, fmt.Errorf("IP %s is denied", host)
 		}
-		resolved.ips = []netip.Addr{ip}
-		return resolved, nil
+		return []netip.Addr{ip}, nil
 	}
 
 	if !d.acl.AllowDomain(host) {
-		return endpoint{}, fmt.Errorf("domain %s is denied", host)
+		return nil, fmt.Errorf("domain %s is denied", host)
 	}
 
 	lookupHost := strings.TrimSuffix(host, ".")
 	if lookupHost == "" {
-		return endpoint{}, fmt.Errorf("target host is empty")
+		return nil, fmt.Errorf("target host is empty")
 	}
 	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip", lookupHost)
 	if err != nil {
-		return endpoint{}, fmt.Errorf("lookup %s: %w", host, err)
+		return nil, fmt.Errorf("lookup %s: %w", host, err)
 	}
 
 	seen := make(map[netip.Addr]struct{}, len(addresses))
+	ips := make([]netip.Addr, 0, len(addresses))
 	for _, address := range addresses {
 		address = address.Unmap()
 		if !address.IsValid() || address.Zone() != "" || !d.acl.AllowIP(address) {
@@ -128,33 +157,10 @@ func (d *Dialer) resolve(ctx context.Context, hostPort string) (endpoint, error)
 			continue
 		}
 		seen[address] = struct{}{}
-		resolved.ips = append(resolved.ips, address)
+		ips = append(ips, address)
 	}
-	if len(resolved.ips) == 0 {
-		return endpoint{}, fmt.Errorf("no allowed IP addresses for %s", host)
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no allowed IP addresses for %s", host)
 	}
-	return resolved, nil
-}
-
-// dialAny establishes a connection to one of the target's authorized
-// addresses. Keeping the network separate lets a future DialUDP reuse the same
-// resolution and authorization path.
-func (d *Dialer) dialAny(ctx context.Context, network string, endpoint endpoint) (net.Conn, error) {
-	if len(endpoint.ips) == 0 {
-		return nil, fmt.Errorf("no authorized IP addresses for %s", endpoint.host)
-	}
-
-	var lastErr error
-	for _, ip := range endpoint.ips {
-		address := net.JoinHostPort(ip.String(), strconv.Itoa(endpoint.port))
-		conn, err := d.netDialer.DialContext(ctx, network, address)
-		if err == nil {
-			return conn, nil
-		}
-		lastErr = fmt.Errorf("dial %s: %w", address, err)
-	}
-	if lastErr == nil {
-		return nil, fmt.Errorf("no allowed IP addresses for %s", endpoint.host)
-	}
-	return nil, lastErr
+	return ips, nil
 }

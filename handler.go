@@ -121,7 +121,7 @@ func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	targetConn, err := h.dialer.DialTCP(r.Context(), hostPort)
+	targetConn, err := h.dialer.Dial(r.Context(), hostPort)
 	if err != nil {
 		return caddyhttp.Error(http.StatusBadGateway, err)
 	}
