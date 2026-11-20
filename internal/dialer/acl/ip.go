@@ -2,7 +2,6 @@ package acl
 
 import (
 	"fmt"
-	"net"
 	"net/netip"
 	"strings"
 )
@@ -41,15 +40,11 @@ func parseIPRule(subject string, allow bool) (ipRule, error) {
 	}, nil
 }
 
-func (r ipRule) matches(ip net.IP) bool {
+func (r ipRule) matches(ip netip.Addr) bool {
 	if r.any {
 		return true
 	}
-	addr, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return false
-	}
-	return r.prefix.Contains(addr.Unmap())
+	return r.prefix.Contains(ip)
 }
 
 var defaultDeniedPrefixes = []netip.Prefix{

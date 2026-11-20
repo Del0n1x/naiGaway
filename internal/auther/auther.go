@@ -1,5 +1,5 @@
-// Package auth validates proxy credentials.
-package auth
+// Package auther validates proxy credentials.
+package auther
 
 import (
 	"encoding/base64"
@@ -21,18 +21,18 @@ type entry struct {
 	username string
 }
 
-// Authenticator holds pre-encoded credentials for constant-time comparison.
-type Authenticator struct {
+// Auther holds pre-encoded credentials for constant-time comparison.
+type Auther struct {
 	entries []entry
 }
 
 // New validates and encodes credentials.
-func New(credentials []Credential) (*Authenticator, error) {
+func New(credentials []Credential) (*Auther, error) {
 	if len(credentials) == 0 {
 		return nil, errors.New("at least one auth credential is required")
 	}
 
-	authenticator := &Authenticator{
+	auther := &Auther{
 		entries: make([]entry, 0, len(credentials)),
 	}
 	for _, credential := range credentials {
@@ -47,16 +47,16 @@ func New(credentials []Credential) (*Authenticator, error) {
 		}
 
 		raw := []byte(credential.Username + ":" + credential.Password)
-		authenticator.entries = append(authenticator.entries, entry{
+		auther.entries = append(auther.entries, entry{
 			encoded:  base64.StdEncoding.EncodeToString(raw),
 			username: credential.Username,
 		})
 	}
-	return authenticator, nil
+	return auther, nil
 }
 
 // Check validates the Proxy-Authorization header on req.
-func (a *Authenticator) Check(req *http.Request) error {
+func (a *Auther) Check(req *http.Request) error {
 	value := req.Header.Get("Proxy-Authorization")
 	space := strings.IndexByte(value, ' ')
 	if space < 0 {

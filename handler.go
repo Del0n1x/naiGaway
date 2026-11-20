@@ -3,11 +3,13 @@ package naiveproxy
 
 import (
 	"fmt"
-	"net"
+	"net/http"
 	"time"
 
-	"github.com/Del0n1x/caddyNaive/internal/acl"
-	"github.com/Del0n1x/caddyNaive/internal/auth"
+	"github.com/Del0n1x/caddyNaive/internal/auther"
+	"github.com/Del0n1x/caddyNaive/internal/dialer"
+	"github.com/Del0n1x/caddyNaive/internal/dialer/acl"
+	"github.com/Del0n1x/caddyNaive/internal/padding"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
@@ -20,30 +22,30 @@ func init() {
 //
 // It is intentionally a forward proxy at its core: after authentication, a
 // CONNECT request is tunneled to the requested target. NaiveProxy-specific
-// behavior (padding, fast open and long-lived authenticated tunnels) is layered
-// on top of that tunnel.
+// behavior (padding and long-lived authenticated tunnels) is layered on top of
+// that tunnel.
 type Handler struct {
 	// Auth is the list of accepted proxy credentials.
-	Auth []auth.Credential `json:"auth,omitempty"`
+	Auth []auther.Credential `json:"auth,omitempty"`
 
 	// Padding enables the NaiveProxy padding protocol. Default: true.
 	Padding *bool `json:"padding,omitempty"`
-
-	// FastOpen sends the CONNECT response before dialing the target. Default: true.
-	FastOpen *bool `json:"fast_open,omitempty"`
 
 	// IdleTimeout is the idle timeout applied to authenticated HTTP/2 and HTTP/3
 	// tunnels. Default: 24h.
 	IdleTimeout caddy.Duration `json:"idle_timeout,omitempty"`
 
-	// DialTimeout limits the initial TCP connection to the target. Default: 30s.
+	// DialTimeout limits target resolution and connection establishment.
+	// Default: 30s.
 	DialTimeout caddy.Duration `json:"dial_timeout,omitempty"`
 
 	// ACL controls destination ports, domains, and IP addresses.
 	ACL acl.Config `json:"acl,omitempty"`
 
-	authenticator *auth.Authenticator
-	aclChecker    *acl.Checker
+	// Runtime state built once by Provision. All values are immutable and
+	// safe for concurrent use after provisioning.
+	auther *auther.Auther
+	dialer *dialer.Dialer
 }
 
 // CaddyModule returns the Caddy module information.
@@ -56,22 +58,21 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 
 // Provision prepares the handler.
 func (h *Handler) Provision(_ caddy.Context) error {
-	authenticator, err := auth.New(h.Auth)
+	a, err := auther.New(h.Auth)
 	if err != nil {
 		return err
 	}
-	h.authenticator = authenticator
+	h.auther = a
 
-	dialer := &net.Dialer{
+	targetDialer, err := dialer.New(dialer.Config{
+		ACL:       h.ACL,
 		Timeout:   h.dialTimeout(),
 		KeepAlive: 30 * time.Second,
-	}
-
-	checker, err := acl.New(h.ACL, dialer.DialContext)
+	})
 	if err != nil {
 		return err
 	}
-	h.aclChecker = checker
+	h.dialer = targetDialer
 
 	return nil
 }
@@ -90,12 +91,64 @@ func (h *Handler) Validate() error {
 	return nil
 }
 
-func (h *Handler) paddingEnabled() bool {
-	return boolDefault(h.Padding, true)
+// ServeHTTP implements caddyhttp.MiddlewareHandler.
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	// This handler only proxies HTTP/2 and HTTP/3 CONNECT. Everything else
+	// falls through to the website/reverse-proxy routes.
+	if r.Method != http.MethodConnect || (r.ProtoMajor != 2 && r.ProtoMajor != 3) {
+		return next.ServeHTTP(w, r)
+	}
+	if h.auther.Check(r) != nil {
+		return next.ServeHTTP(w, r)
+	}
+
+	return h.serveConnect(w, r)
 }
 
-func (h *Handler) fastOpenEnabled() bool {
-	return boolDefault(h.FastOpen, true)
+func (h *Handler) serveConnect(w http.ResponseWriter, r *http.Request) error {
+	if r.URL.Scheme != "" || r.URL.Path != "" {
+		return caddyhttp.Error(http.StatusBadRequest,
+			fmt.Errorf("CONNECT request contains :scheme or :path"))
+	}
+
+	hostPort := r.URL.Host
+	if hostPort == "" {
+		hostPort = r.Host
+	}
+
+	usePadding, paddingReply := padding.Negotiate(r.Header, h.paddingEnabled())
+	if err := h.writeConnectResponse(w, usePadding, paddingReply); err != nil {
+		return err
+	}
+
+	targetConn, err := h.dialer.DialTCP(r.Context(), hostPort)
+	if err != nil {
+		return caddyhttp.Error(http.StatusBadGateway, err)
+	}
+	defer targetConn.Close()
+
+	if reader, _ := caddyhttp.IdleTimeoutsFromContext(r.Context()); reader != nil {
+		reader.Override(h.idleTimeout(), 0)
+	}
+	defer r.Body.Close()
+	return padding.DualStream(targetConn, r.Body, w, usePadding)
+}
+
+func (h *Handler) writeConnectResponse(w http.ResponseWriter, usePadding bool, paddingReply string) error {
+	w.Header().Set(padding.TypeReplyHeader, paddingReply)
+	if usePadding {
+		w.Header().Set(padding.Header, padding.NewHeader())
+	}
+	w.WriteHeader(http.StatusOK)
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		return caddyhttp.Error(http.StatusInternalServerError,
+			fmt.Errorf("flush CONNECT response: %w", err))
+	}
+	return nil
+}
+
+func (h *Handler) paddingEnabled() bool {
+	return boolDefault(h.Padding, true)
 }
 
 func (h *Handler) dialTimeout() time.Duration {
